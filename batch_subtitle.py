@@ -3,35 +3,45 @@ import subprocess
 import sys
 from pathlib import Path
 
-def convert_video_to_wav(video_path, sample_rate=16000):
+def extract_audio_from_video(video_path, sample_rate=16000):
     """
-    将视频文件转换为指定采样率的WAV文件
+    通过 ffmpeg 从视频中提取音频 (PCM s16le)，不落盘
     """
+    import numpy as np
+
     video_path = Path(video_path)
-    wav_path = video_path.with_suffix('.wav')
-    
-    # 构建ffmpeg命令
     cmd = [
         'ffmpeg',
+        '-hide_banner',
+        '-loglevel', 'error',
         '-i', str(video_path),
+        '-vn',
         '-ar', str(sample_rate),
         '-ac', '1',  # 单声道
-        '-y',  # 覆盖已存在的文件
-        str(wav_path)
+        '-f', 's16le',
+        '-acodec', 'pcm_s16le',
+        '-',
     ]
     
     try:
-        print(f"正在转换: {video_path.name}")
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-        print(f"转换完成: {wav_path.name}")
-        return wav_path
+        print(f"提取音频: {video_path.name}")
+        completed = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        audio = np.frombuffer(completed.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+        if audio.size == 0:
+            print("提取失败: 未获得音频数据")
+            return None
+        return audio
     except subprocess.CalledProcessError as e:
-        print(f"转换失败: {e.stderr}")
+        stderr = (e.stderr or b"").decode("utf-8", errors="replace")
+        print(f"提取失败: {stderr.strip()}")
+        return None
+    except FileNotFoundError:
+        print("提取失败: 未找到 ffmpeg，请先安装并确保在 PATH 中")
         return None
 
-def transcribe_audio_to_srt(wav_path, model_path="whisper-large-v3-turbo-int4-ov", device="GPU"):
+def transcribe_audio_to_srt(video_path, model_path="whisper-large-v3-turbo-int4-ov", device="GPU"):
     """
-    将WAV文件转录为SRT字幕
+    将视频文件转录为SRT字幕（音频通过管道获取，不落盘）
     """
     try:
         # 初始化模型
@@ -44,16 +54,17 @@ def transcribe_audio_to_srt(wav_path, model_path="whisper-large-v3-turbo-int4-ov
         config.task = "transcribe"
         config.return_timestamps = True
         
-        # 读取音频
-        print(f"读取音频: {wav_path.name}")
-        raw_speech, _ = librosa.load(str(wav_path), sr=16000)
+        # 提取音频（不落盘）
+        raw_speech = extract_audio_from_video(video_path, sample_rate=16000)
+        if raw_speech is None:
+            return None
         
         # 推理
         print("开始转录...")
         result = pipe.generate(raw_speech, config)
         
         # 生成SRT文件
-        srt_path = wav_path.with_suffix('.srt')
+        srt_path = Path(video_path).with_suffix('.srt')
         save_srt(result, srt_path)
         
         print(f"字幕已保存: {srt_path.name}")
@@ -108,22 +119,12 @@ def process_single_video(video_path, model_path, device, keep_wav=False):
     """
     print(f"\n处理文件: {video_path}")
     print("-" * 50)
+
+    if keep_wav:
+        print("提示: 已启用管道模式，不再生成临时 .wav 文件，`--keep-wav` 将被忽略")
     
-    # 步骤1: 转换为WAV
-    wav_path = convert_video_to_wav(video_path)
-    if not wav_path or not wav_path.exists():
-        return False
-    
-    # 步骤2: 转录为SRT
-    srt_path = transcribe_audio_to_srt(wav_path, model_path, device)
-    
-    # 步骤3: 清理临时文件
-    if not keep_wav:
-        try:
-            wav_path.unlink()
-            print(f"已删除临时文件: {wav_path.name}")
-        except Exception as e:
-            print(f"删除临时文件失败: {e}")
+    # 转录为 SRT（音频不落盘）
+    srt_path = transcribe_audio_to_srt(video_path, model_path, device)
     
     return srt_path is not None
 
@@ -228,11 +229,11 @@ if __name__ == "__main__":
     # 检查必要的依赖
     try:
         import openvino_genai
-        import librosa
+        import numpy
     except ImportError as e:
         print(f"错误: 缺少必要的库 - {e}")
         print("请安装以下库:")
-        print("  pip install openvino-genai librosa")
+        print("  pip install openvino-genai numpy")
         sys.exit(1)
     
     main()
